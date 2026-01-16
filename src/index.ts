@@ -8,6 +8,8 @@ import {
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 import axios, { AxiosInstance, AxiosError } from "axios";
+import http from "http";
+import https from "https";
 
 // =============================================================================
 // CrowdStrike API Client
@@ -38,6 +40,20 @@ class CrowdStrikeClient {
       headers: {
         "Content-Type": "application/json",
       },
+      // Enable HTTP connection pooling for better performance
+      httpAgent: new http.Agent({
+        keepAlive: true,
+        keepAliveMsecs: 30000,
+        maxSockets: 50,
+        maxFreeSockets: 10,
+      }),
+      httpsAgent: new https.Agent({
+        keepAlive: true,
+        keepAliveMsecs: 30000,
+        maxSockets: 50,
+        maxFreeSockets: 10,
+      }),
+      timeout: 30000,
     });
   }
 
@@ -48,8 +64,9 @@ class CrowdStrikeClient {
     }
 
     try {
-      const response = await axios.post<TokenResponse>(
-        `${this.config.baseUrl}/oauth2/token`,
+      // Use the configured httpClient for auth to benefit from connection pooling
+      const response = await this.httpClient.post<TokenResponse>(
+        "/oauth2/token",
         new URLSearchParams({
           client_id: this.config.clientId,
           client_secret: this.config.clientSecret,
@@ -105,6 +122,16 @@ class CrowdStrikeClient {
     }
   }
 
+  // Input validation helper for array-based operations
+  private validateIds(ids: string[], operation: string, maxBatchSize: number = 500): void {
+    if (!ids || ids.length === 0) {
+      throw new Error(`${operation} requires at least one ID`);
+    }
+    if (ids.length > maxBatchSize) {
+      throw new Error(`${operation} supports a maximum of ${maxBatchSize} IDs per request`);
+    }
+  }
+
   // =========================================================================
   // Hosts API
   // =========================================================================
@@ -139,6 +166,7 @@ class CrowdStrikeClient {
   }
 
   async getHostDetails(hostIds: string[]): Promise<unknown> {
+    this.validateIds(hostIds, "Get host details", 5000);
     return this.request<unknown>(
       "POST",
       "/devices/entities/devices/v2",
@@ -146,7 +174,20 @@ class CrowdStrikeClient {
     );
   }
 
+  // New API: GetDeviceDetailsV2 (replaces deprecated GetDeviceDetails)
+  // Uses GET with query params instead of POST with body
+  async getHostDetailsV2(hostIds: string[]): Promise<unknown> {
+    this.validateIds(hostIds, "Get host details v2", 5000);
+    return this.request<unknown>(
+      "GET",
+      "/devices/entities/devices/v2",
+      undefined,
+      { ids: hostIds }
+    );
+  }
+
   async containHost(hostIds: string[]): Promise<unknown> {
+    this.validateIds(hostIds, "Contain host", 100);
     return this.request<unknown>(
       "POST",
       "/devices/entities/devices-actions/v2",
@@ -156,6 +197,7 @@ class CrowdStrikeClient {
   }
 
   async liftContainment(hostIds: string[]): Promise<unknown> {
+    this.validateIds(hostIds, "Lift containment", 100);
     return this.request<unknown>(
       "POST",
       "/devices/entities/devices-actions/v2",
@@ -165,6 +207,7 @@ class CrowdStrikeClient {
   }
 
   async hideHost(hostIds: string[]): Promise<unknown> {
+    this.validateIds(hostIds, "Hide host", 100);
     return this.request<unknown>(
       "POST",
       "/devices/entities/devices-actions/v2",
@@ -174,6 +217,7 @@ class CrowdStrikeClient {
   }
 
   async unhideHost(hostIds: string[]): Promise<unknown> {
+    this.validateIds(hostIds, "Unhide host", 100);
     return this.request<unknown>(
       "POST",
       "/devices/entities/devices-actions/v2",
@@ -568,7 +612,23 @@ const TOOLS: Tool[] = [
   {
     name: "crowdstrike_get_host_details",
     description:
-      "Get detailed information about specific hosts by their device IDs.",
+      "Get detailed information about specific hosts by their device IDs. Note: This uses the legacy POST-based API. Consider using crowdstrike_get_host_details_v2 for the newer GET-based endpoint.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        host_ids: {
+          type: "array",
+          items: { type: "string" },
+          description: "Array of host/device IDs to retrieve",
+        },
+      },
+      required: ["host_ids"],
+    },
+  },
+  {
+    name: "crowdstrike_get_host_details_v2",
+    description:
+      "Get detailed information about specific hosts by their device IDs using the newer V2 API (GET-based). This is the recommended method going forward.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -1096,26 +1156,33 @@ const TOOLS: Tool[] = [
 // Main Server Logic
 // =============================================================================
 
-async function main() {
-  // Validate environment variables
+// Lazy-initialized client - only created when credentials are available and a tool is called
+let client: CrowdStrikeClient | null = null;
+
+function getClient(): CrowdStrikeClient {
   const clientId = process.env.CROWDSTRIKE_CLIENT_ID;
   const clientSecret = process.env.CROWDSTRIKE_CLIENT_SECRET;
   const baseUrl =
     process.env.CROWDSTRIKE_BASE_URL || "https://api.crowdstrike.com";
 
   if (!clientId || !clientSecret) {
-    console.error(
-      "Error: CROWDSTRIKE_CLIENT_ID and CROWDSTRIKE_CLIENT_SECRET environment variables are required"
+    throw new Error(
+      "CrowdStrike credentials not configured. Please set the CROWDSTRIKE_CLIENT_ID and CROWDSTRIKE_CLIENT_SECRET environment variables."
     );
-    process.exit(1);
   }
 
-  const client = new CrowdStrikeClient({
-    clientId,
-    clientSecret,
-    baseUrl,
-  });
+  if (!client) {
+    client = new CrowdStrikeClient({
+      clientId,
+      clientSecret,
+      baseUrl,
+    });
+  }
 
+  return client;
+}
+
+async function main() {
   const server = new Server(
     {
       name: "crowdstrike-mcp",
@@ -1138,12 +1205,14 @@ async function main() {
     const { name, arguments: args } = request.params;
 
     try {
+      // Get the client - this will throw if credentials are not configured
+      const apiClient = getClient();
       let result: unknown;
 
       switch (name) {
         // Host operations
         case "crowdstrike_search_hosts":
-          result = await client.searchHosts(
+          result = await apiClient.searchHosts(
             args?.filter as string | undefined,
             (args?.limit as number) || 100,
             args?.offset as number | undefined,
@@ -1152,28 +1221,32 @@ async function main() {
           break;
 
         case "crowdstrike_get_host_details":
-          result = await client.getHostDetails(args?.host_ids as string[]);
+          result = await apiClient.getHostDetails(args?.host_ids as string[]);
+          break;
+
+        case "crowdstrike_get_host_details_v2":
+          result = await apiClient.getHostDetailsV2(args?.host_ids as string[]);
           break;
 
         case "crowdstrike_contain_host":
-          result = await client.containHost(args?.host_ids as string[]);
+          result = await apiClient.containHost(args?.host_ids as string[]);
           break;
 
         case "crowdstrike_lift_containment":
-          result = await client.liftContainment(args?.host_ids as string[]);
+          result = await apiClient.liftContainment(args?.host_ids as string[]);
           break;
 
         case "crowdstrike_hide_host":
-          result = await client.hideHost(args?.host_ids as string[]);
+          result = await apiClient.hideHost(args?.host_ids as string[]);
           break;
 
         case "crowdstrike_unhide_host":
-          result = await client.unhideHost(args?.host_ids as string[]);
+          result = await apiClient.unhideHost(args?.host_ids as string[]);
           break;
 
         // Detection operations
         case "crowdstrike_search_detections":
-          result = await client.searchDetections(
+          result = await apiClient.searchDetections(
             args?.filter as string | undefined,
             (args?.limit as number) || 100,
             args?.offset as number | undefined,
@@ -1182,13 +1255,13 @@ async function main() {
           break;
 
         case "crowdstrike_get_detection_details":
-          result = await client.getDetectionDetails(
+          result = await apiClient.getDetectionDetails(
             args?.detection_ids as string[]
           );
           break;
 
         case "crowdstrike_update_detection":
-          result = await client.updateDetectionStatus(
+          result = await apiClient.updateDetectionStatus(
             args?.detection_ids as string[],
             args?.status as string,
             args?.assigned_to_uuid as string | undefined,
@@ -1198,7 +1271,7 @@ async function main() {
 
         // Incident operations
         case "crowdstrike_search_incidents":
-          result = await client.searchIncidents(
+          result = await apiClient.searchIncidents(
             args?.filter as string | undefined,
             (args?.limit as number) || 100,
             args?.offset as number | undefined,
@@ -1207,13 +1280,13 @@ async function main() {
           break;
 
         case "crowdstrike_get_incident_details":
-          result = await client.getIncidentDetails(
+          result = await apiClient.getIncidentDetails(
             args?.incident_ids as string[]
           );
           break;
 
         case "crowdstrike_update_incident":
-          result = await client.updateIncident(
+          result = await apiClient.updateIncident(
             args?.incident_ids as string[],
             args?.status as number | undefined,
             args?.assigned_to_uuid as string | undefined,
@@ -1222,16 +1295,16 @@ async function main() {
           break;
 
         case "crowdstrike_get_behaviors":
-          result = await client.getBehaviors(args?.behavior_ids as string[]);
+          result = await apiClient.getBehaviors(args?.behavior_ids as string[]);
           break;
 
         case "crowdstrike_get_crowdscore":
-          result = await client.getCrowdScore();
+          result = await apiClient.getCrowdScore();
           break;
 
         // IOC operations
         case "crowdstrike_search_iocs":
-          result = await client.searchIOCs(
+          result = await apiClient.searchIOCs(
             args?.filter as string | undefined,
             (args?.limit as number) || 100,
             args?.offset as number | undefined,
@@ -1240,11 +1313,11 @@ async function main() {
           break;
 
         case "crowdstrike_get_ioc_details":
-          result = await client.getIOCDetails(args?.ioc_ids as string[]);
+          result = await apiClient.getIOCDetails(args?.ioc_ids as string[]);
           break;
 
         case "crowdstrike_create_ioc":
-          result = await client.createIOC(
+          result = await apiClient.createIOC(
             args?.type as string,
             args?.value as string,
             args?.action as string,
@@ -1257,12 +1330,12 @@ async function main() {
           break;
 
         case "crowdstrike_delete_ioc":
-          result = await client.deleteIOC(args?.ioc_ids as string[]);
+          result = await apiClient.deleteIOC(args?.ioc_ids as string[]);
           break;
 
         // Vulnerability operations
         case "crowdstrike_search_vulnerabilities":
-          result = await client.searchVulnerabilities(
+          result = await apiClient.searchVulnerabilities(
             args?.filter as string | undefined,
             (args?.limit as number) || 100,
             args?.facet as string[] | undefined
@@ -1271,7 +1344,7 @@ async function main() {
 
         // Host group operations
         case "crowdstrike_search_host_groups":
-          result = await client.searchHostGroups(
+          result = await apiClient.searchHostGroups(
             args?.filter as string | undefined,
             (args?.limit as number) || 100,
             args?.offset as number | undefined
@@ -1280,7 +1353,7 @@ async function main() {
 
         // Sensor operations
         case "crowdstrike_get_sensor_installers":
-          result = await client.getSensorInstallerDetails(
+          result = await apiClient.getSensorInstallerDetails(
             args?.filter as string | undefined,
             (args?.limit as number) || 100
           );
@@ -1288,7 +1361,7 @@ async function main() {
 
         // Alert operations
         case "crowdstrike_search_alerts":
-          result = await client.searchAlerts(
+          result = await apiClient.searchAlerts(
             args?.filter as string | undefined,
             (args?.limit as number) || 100,
             args?.offset as number | undefined,
@@ -1297,11 +1370,11 @@ async function main() {
           break;
 
         case "crowdstrike_get_alert_details":
-          result = await client.getAlertDetails(args?.alert_ids as string[]);
+          result = await apiClient.getAlertDetails(args?.alert_ids as string[]);
           break;
 
         case "crowdstrike_update_alerts":
-          result = await client.updateAlerts(
+          result = await apiClient.updateAlerts(
             args?.alert_ids as string[],
             args?.action as string,
             args?.value as string | undefined
