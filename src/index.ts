@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 
+import dotenv from "dotenv";
+import { fileURLToPath } from "url";
+import { dirname, resolve } from "path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -10,6 +13,10 @@ import {
 import axios, { AxiosInstance, AxiosError } from "axios";
 import http from "http";
 import https from "https";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+dotenv.config({ path: resolve(__dirname, "../.env") });
 
 // =============================================================================
 // CrowdStrike API Client
@@ -75,7 +82,7 @@ class CrowdStrikeClient {
           headers: {
             "Content-Type": "application/x-www-form-urlencoded",
           },
-        }
+        },
       );
 
       this.accessToken = response.data.access_token;
@@ -83,7 +90,7 @@ class CrowdStrikeClient {
     } catch (error) {
       if (error instanceof AxiosError) {
         throw new Error(
-          `Authentication failed: ${error.response?.data?.errors?.[0]?.message || error.message}`
+          `Authentication failed: ${error.response?.data?.errors?.[0]?.message || error.message}`,
         );
       }
       throw error;
@@ -94,7 +101,7 @@ class CrowdStrikeClient {
     method: "GET" | "POST" | "PATCH" | "DELETE",
     endpoint: string,
     data?: Record<string, unknown>,
-    params?: Record<string, string | number | boolean | string[]>
+    params?: Record<string, string | number | boolean | string[]>,
   ): Promise<T> {
     await this.authenticate();
 
@@ -123,12 +130,18 @@ class CrowdStrikeClient {
   }
 
   // Input validation helper for array-based operations
-  private validateIds(ids: string[], operation: string, maxBatchSize: number = 500): void {
+  private validateIds(
+    ids: string[],
+    operation: string,
+    maxBatchSize: number = 500,
+  ): void {
     if (!ids || ids.length === 0) {
       throw new Error(`${operation} requires at least one ID`);
     }
     if (ids.length > maxBatchSize) {
-      throw new Error(`${operation} supports a maximum of ${maxBatchSize} IDs per request`);
+      throw new Error(
+        `${operation} supports a maximum of ${maxBatchSize} IDs per request`,
+      );
     }
   }
 
@@ -140,7 +153,7 @@ class CrowdStrikeClient {
     filter?: string,
     limit: number = 100,
     offset?: number,
-    sort?: string
+    sort?: string,
   ): Promise<unknown> {
     const params: Record<string, string | number> = { limit };
     if (filter) params.filter = filter;
@@ -151,27 +164,102 @@ class CrowdStrikeClient {
       "GET",
       "/devices/queries/devices/v1",
       undefined,
-      params
+      params,
     );
 
     if (!idsResponse.resources || idsResponse.resources.length === 0) {
       return { resources: [] };
     }
 
+    return this.request<unknown>("POST", "/devices/entities/devices/v2", {
+      ids: idsResponse.resources,
+    });
+  }
+
+  // Get host statistics from the dashboard (total counts, workstation/server breakdown)
+  async getHostStatistics(): Promise<unknown> {
     return this.request<unknown>(
-      "POST",
-      "/devices/entities/devices/v2",
-      { ids: idsResponse.resources }
+      "GET",
+      "/devices/aggregates/device-count-collection/GET/v1",
     );
+  }
+
+  // Search ALL hosts by intelligently bypassing the 10k pagination limit
+  // Uses filter-based chunking to retrieve complete host inventory
+  async searchAllHosts(filter?: string, sort?: string): Promise<unknown> {
+    const allHostIds: string[] = [];
+    const platforms = ["Windows", "Linux", "Mac"];
+
+    // Query each platform separately to bypass 10k limit
+    for (const platform of platforms) {
+      const platformFilter = filter
+        ? `${filter}+platform_name:'${platform}'`
+        : `platform_name:'${platform}'`;
+
+      let offset = 0;
+      const batchSize = 5000;
+      let hasMore = true;
+
+      while (hasMore && offset < 10000) {
+        const params: Record<string, string | number> = {
+          filter: platformFilter,
+          limit: batchSize,
+          offset,
+        };
+        if (sort) params.sort = sort;
+
+        const idsResponse = await this.request<{
+          resources: string[];
+          meta: { pagination: { total: number } };
+        }>("GET", "/devices/queries/devices/v1", undefined, params);
+
+        if (idsResponse.resources && idsResponse.resources.length > 0) {
+          allHostIds.push(...idsResponse.resources);
+          offset += batchSize;
+
+          // Check if we've reached the end
+          hasMore = idsResponse.resources.length === batchSize;
+        } else {
+          hasMore = false;
+        }
+      }
+    }
+
+    // Now fetch full details for all hosts in batches
+    if (allHostIds.length === 0) {
+      return { resources: [], meta: { total_fetched: 0 } };
+    }
+
+    const allHosts: any[] = [];
+    const detailBatchSize = 500; // API limit for detail fetching
+
+    for (let i = 0; i < allHostIds.length; i += detailBatchSize) {
+      const batchIds = allHostIds.slice(i, i + detailBatchSize);
+      const detailsResponse = await this.request<{ resources: any[] }>(
+        "POST",
+        "/devices/entities/devices/v2",
+        { ids: batchIds },
+      );
+
+      if (detailsResponse.resources) {
+        allHosts.push(...detailsResponse.resources);
+      }
+    }
+
+    return {
+      resources: allHosts,
+      meta: {
+        total_fetched: allHosts.length,
+        pagination_method: "platform-based chunking",
+      },
+    };
   }
 
   async getHostDetails(hostIds: string[]): Promise<unknown> {
     this.validateIds(hostIds, "Get host details", 5000);
-    return this.request<unknown>(
-      "POST",
-      "/devices/entities/devices/v2",
-      { ids: hostIds }
-    );
+    return this.request<unknown>("POST", "/devices/entities/devices/v2", {
+      ids: hostIds,
+    });
   }
 
   // New API: GetDeviceDetailsV2 (replaces deprecated GetDeviceDetails)
@@ -182,7 +270,7 @@ class CrowdStrikeClient {
       "GET",
       "/devices/entities/devices/v2",
       undefined,
-      { ids: hostIds }
+      { ids: hostIds },
     );
   }
 
@@ -192,7 +280,7 @@ class CrowdStrikeClient {
       "POST",
       "/devices/entities/devices-actions/v2",
       { ids: hostIds },
-      { action_name: "contain" }
+      { action_name: "contain" },
     );
   }
 
@@ -202,7 +290,7 @@ class CrowdStrikeClient {
       "POST",
       "/devices/entities/devices-actions/v2",
       { ids: hostIds },
-      { action_name: "lift_containment" }
+      { action_name: "lift_containment" },
     );
   }
 
@@ -212,7 +300,7 @@ class CrowdStrikeClient {
       "POST",
       "/devices/entities/devices-actions/v2",
       { ids: hostIds },
-      { action_name: "hide_host" }
+      { action_name: "hide_host" },
     );
   }
 
@@ -222,7 +310,7 @@ class CrowdStrikeClient {
       "POST",
       "/devices/entities/devices-actions/v2",
       { ids: hostIds },
-      { action_name: "unhide_host" }
+      { action_name: "unhide_host" },
     );
   }
 
@@ -234,7 +322,7 @@ class CrowdStrikeClient {
     filter?: string,
     limit: number = 100,
     offset?: number,
-    sort?: string
+    sort?: string,
   ): Promise<unknown> {
     const params: Record<string, string | number> = { limit };
     if (filter) params.filter = filter;
@@ -245,33 +333,29 @@ class CrowdStrikeClient {
       "GET",
       "/detects/queries/detects/v1",
       undefined,
-      params
+      params,
     );
 
     if (!idsResponse.resources || idsResponse.resources.length === 0) {
       return { resources: [] };
     }
 
-    return this.request<unknown>(
-      "POST",
-      "/detects/entities/summaries/GET/v1",
-      { ids: idsResponse.resources }
-    );
+    return this.request<unknown>("POST", "/detects/entities/summaries/GET/v1", {
+      ids: idsResponse.resources,
+    });
   }
 
   async getDetectionDetails(detectionIds: string[]): Promise<unknown> {
-    return this.request<unknown>(
-      "POST",
-      "/detects/entities/summaries/GET/v1",
-      { ids: detectionIds }
-    );
+    return this.request<unknown>("POST", "/detects/entities/summaries/GET/v1", {
+      ids: detectionIds,
+    });
   }
 
   async updateDetectionStatus(
     detectionIds: string[],
     status: string,
     assignedToUuid?: string,
-    comment?: string
+    comment?: string,
   ): Promise<unknown> {
     const body: Record<string, unknown> = {
       ids: detectionIds,
@@ -280,11 +364,7 @@ class CrowdStrikeClient {
     if (assignedToUuid) body.assigned_to_uuid = assignedToUuid;
     if (comment) body.comment = comment;
 
-    return this.request<unknown>(
-      "PATCH",
-      "/detects/entities/detects/v2",
-      body
-    );
+    return this.request<unknown>("PATCH", "/detects/entities/detects/v2", body);
   }
 
   // =========================================================================
@@ -295,7 +375,7 @@ class CrowdStrikeClient {
     filter?: string,
     limit: number = 100,
     offset?: number,
-    sort?: string
+    sort?: string,
   ): Promise<unknown> {
     const params: Record<string, string | number> = { limit };
     if (filter) params.filter = filter;
@@ -306,7 +386,7 @@ class CrowdStrikeClient {
       "GET",
       "/incidents/queries/incidents/v1",
       undefined,
-      params
+      params,
     );
 
     if (!idsResponse.resources || idsResponse.resources.length === 0) {
@@ -316,7 +396,7 @@ class CrowdStrikeClient {
     return this.request<unknown>(
       "POST",
       "/incidents/entities/incidents/GET/v1",
-      { ids: idsResponse.resources }
+      { ids: idsResponse.resources },
     );
   }
 
@@ -324,7 +404,7 @@ class CrowdStrikeClient {
     return this.request<unknown>(
       "POST",
       "/incidents/entities/incidents/GET/v1",
-      { ids: incidentIds }
+      { ids: incidentIds },
     );
   }
 
@@ -332,7 +412,7 @@ class CrowdStrikeClient {
     incidentIds: string[],
     status?: number,
     assignedToUuid?: string,
-    tags?: string[]
+    tags?: string[],
   ): Promise<unknown> {
     const actionParams: Record<string, unknown>[] = [];
 
@@ -340,7 +420,10 @@ class CrowdStrikeClient {
       actionParams.push({ name: "update_status", value: status.toString() });
     }
     if (assignedToUuid) {
-      actionParams.push({ name: "update_assigned_to_v2", value: assignedToUuid });
+      actionParams.push({
+        name: "update_assigned_to_v2",
+        value: assignedToUuid,
+      });
     }
     if (tags) {
       tags.forEach((tag) => {
@@ -354,7 +437,7 @@ class CrowdStrikeClient {
       {
         ids: incidentIds,
         action_parameters: actionParams,
-      }
+      },
     );
   }
 
@@ -362,15 +445,12 @@ class CrowdStrikeClient {
     return this.request<unknown>(
       "POST",
       "/incidents/entities/behaviors/GET/v1",
-      { ids: behaviorIds }
+      { ids: behaviorIds },
     );
   }
 
   async getCrowdScore(): Promise<unknown> {
-    return this.request<unknown>(
-      "GET",
-      "/incidents/combined/crowdscores/v1"
-    );
+    return this.request<unknown>("GET", "/incidents/combined/crowdscores/v1");
   }
 
   // =========================================================================
@@ -381,7 +461,7 @@ class CrowdStrikeClient {
     filter?: string,
     limit: number = 100,
     offset?: number,
-    sort?: string
+    sort?: string,
   ): Promise<unknown> {
     const params: Record<string, string | number> = { limit };
     if (filter) params.filter = filter;
@@ -392,7 +472,7 @@ class CrowdStrikeClient {
       "GET",
       "/iocs/queries/indicators/v1",
       undefined,
-      params
+      params,
     );
 
     if (!idsResponse.resources || idsResponse.resources.length === 0) {
@@ -403,7 +483,7 @@ class CrowdStrikeClient {
       "GET",
       "/iocs/entities/indicators/v1",
       undefined,
-      { ids: idsResponse.resources }
+      { ids: idsResponse.resources },
     );
   }
 
@@ -412,7 +492,7 @@ class CrowdStrikeClient {
       "GET",
       "/iocs/entities/indicators/v1",
       undefined,
-      { ids: iocIds }
+      { ids: iocIds },
     );
   }
 
@@ -424,7 +504,7 @@ class CrowdStrikeClient {
     description?: string,
     severity?: string,
     expiration?: string,
-    tags?: string[]
+    tags?: string[],
   ): Promise<unknown> {
     const indicator: Record<string, unknown> = {
       type,
@@ -438,11 +518,9 @@ class CrowdStrikeClient {
     if (expiration) indicator.expiration = expiration;
     if (tags) indicator.tags = tags;
 
-    return this.request<unknown>(
-      "POST",
-      "/iocs/entities/indicators/v1",
-      { indicators: [indicator] }
-    );
+    return this.request<unknown>("POST", "/iocs/entities/indicators/v1", {
+      indicators: [indicator],
+    });
   }
 
   async deleteIOC(iocIds: string[]): Promise<unknown> {
@@ -450,7 +528,7 @@ class CrowdStrikeClient {
       "DELETE",
       "/iocs/entities/indicators/v1",
       undefined,
-      { ids: iocIds }
+      { ids: iocIds },
     );
   }
 
@@ -461,7 +539,7 @@ class CrowdStrikeClient {
   async searchVulnerabilities(
     filter?: string,
     limit: number = 100,
-    facet?: string[]
+    facet?: string[],
   ): Promise<unknown> {
     const params: Record<string, string | number | string[]> = { limit };
     if (filter) params.filter = filter;
@@ -471,7 +549,7 @@ class CrowdStrikeClient {
       "GET",
       "/spotlight/combined/vulnerabilities/v1",
       undefined,
-      params as Record<string, string | number>
+      params as Record<string, string | number>,
     );
   }
 
@@ -482,7 +560,7 @@ class CrowdStrikeClient {
   async searchHostGroups(
     filter?: string,
     limit: number = 100,
-    offset?: number
+    offset?: number,
   ): Promise<unknown> {
     const params: Record<string, string | number> = { limit };
     if (filter) params.filter = filter;
@@ -492,7 +570,7 @@ class CrowdStrikeClient {
       "GET",
       "/devices/queries/host-groups/v1",
       undefined,
-      params
+      params,
     );
 
     if (!idsResponse.resources || idsResponse.resources.length === 0) {
@@ -503,7 +581,7 @@ class CrowdStrikeClient {
       "GET",
       "/devices/entities/host-groups/v1",
       undefined,
-      { ids: idsResponse.resources }
+      { ids: idsResponse.resources },
     );
   }
 
@@ -513,7 +591,7 @@ class CrowdStrikeClient {
 
   async getSensorInstallerDetails(
     filter?: string,
-    limit: number = 100
+    limit: number = 100,
   ): Promise<unknown> {
     const params: Record<string, string | number> = { limit };
     if (filter) params.filter = filter;
@@ -522,7 +600,7 @@ class CrowdStrikeClient {
       "GET",
       "/sensors/combined/installers/v2",
       undefined,
-      params
+      params,
     );
   }
 
@@ -534,7 +612,7 @@ class CrowdStrikeClient {
     filter?: string,
     limit: number = 100,
     offset?: number,
-    sort?: string
+    sort?: string,
   ): Promise<unknown> {
     const params: Record<string, string | number> = { limit };
     if (filter) params.filter = filter;
@@ -545,33 +623,27 @@ class CrowdStrikeClient {
       "GET",
       "/alerts/queries/alerts/v2",
       undefined,
-      params
+      params,
     );
   }
 
   async getAlertDetails(alertIds: string[]): Promise<unknown> {
-    return this.request<unknown>(
-      "POST",
-      "/alerts/entities/alerts/v2",
-      { composite_ids: alertIds }
-    );
+    return this.request<unknown>("POST", "/alerts/entities/alerts/v2", {
+      composite_ids: alertIds,
+    });
   }
 
   async updateAlerts(
     alertIds: string[],
     action: string,
-    value?: string
+    value?: string,
   ): Promise<unknown> {
     const body: Record<string, unknown> = {
       composite_ids: alertIds,
       action_parameters: [{ name: action, value: value || "" }],
     };
 
-    return this.request<unknown>(
-      "PATCH",
-      "/alerts/entities/alerts/v3",
-      body
-    );
+    return this.request<unknown>("PATCH", "/alerts/entities/alerts/v3", body);
   }
 }
 
@@ -595,7 +667,8 @@ const TOOLS: Tool[] = [
         },
         limit: {
           type: "number",
-          description: "Maximum number of hosts to return (default: 100, max: 500)",
+          description:
+            "Maximum number of hosts to return (default: 100, max: 500)",
           default: 100,
         },
         offset: {
@@ -702,6 +775,34 @@ const TOOLS: Tool[] = [
         },
       },
       required: ["host_ids"],
+    },
+  },
+  {
+    name: "crowdstrike_get_host_statistics",
+    description:
+      "Get host statistics from the CrowdStrike dashboard. Returns total host count, workstation count, server count, and platform breakdown. Use this to get accurate inventory totals without pagination limits.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {},
+    },
+  },
+  {
+    name: "crowdstrike_search_all_hosts",
+    description:
+      "Search ALL hosts by intelligently bypassing the 10k API pagination limit. Uses platform-based chunking (Windows/Linux/Mac) to retrieve complete host inventory. WARNING: This can take several minutes for large environments (20k+ hosts). Returns all host details with full metadata.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        filter: {
+          type: "string",
+          description:
+            "FQL filter for hosts. Examples: 'last_seen:>=\"2024-01-01\"', 'status:\"normal\"'. NOTE: Do not include platform filters - they are handled automatically.",
+        },
+        sort: {
+          type: "string",
+          description: "Sort field and direction. Example: 'hostname|asc'",
+        },
+      },
     },
   },
 
@@ -1015,7 +1116,8 @@ const TOOLS: Tool[] = [
         },
         limit: {
           type: "number",
-          description: "Maximum number of vulnerabilities to return (default: 100)",
+          description:
+            "Maximum number of vulnerabilities to return (default: 100)",
           default: 100,
         },
         facet: {
@@ -1037,7 +1139,8 @@ const TOOLS: Tool[] = [
       properties: {
         filter: {
           type: "string",
-          description: "FQL filter for host groups. Example: 'name:*Production*'",
+          description:
+            "FQL filter for host groups. Example: 'name:*Production*'",
         },
         limit: {
           type: "number",
@@ -1062,8 +1165,7 @@ const TOOLS: Tool[] = [
       properties: {
         filter: {
           type: "string",
-          description:
-            "FQL filter for installers. Example: 'platform:windows'",
+          description: "FQL filter for installers. Example: 'platform:windows'",
         },
         limit: {
           type: "number",
@@ -1098,14 +1200,16 @@ const TOOLS: Tool[] = [
         },
         sort: {
           type: "string",
-          description: "Sort field and direction. Example: 'created_timestamp|desc'",
+          description:
+            "Sort field and direction. Example: 'created_timestamp|desc'",
         },
       },
     },
   },
   {
     name: "crowdstrike_get_alert_details",
-    description: "Get detailed information about specific alerts by their composite IDs.",
+    description:
+      "Get detailed information about specific alerts by their composite IDs.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -1144,7 +1248,8 @@ const TOOLS: Tool[] = [
         },
         value: {
           type: "string",
-          description: "Value for the action (e.g., status value, UUID, tag name)",
+          description:
+            "Value for the action (e.g., status value, UUID, tag name)",
         },
       },
       required: ["alert_ids", "action"],
@@ -1167,7 +1272,7 @@ function getClient(): CrowdStrikeClient {
 
   if (!clientId || !clientSecret) {
     throw new Error(
-      "CrowdStrike credentials not configured. Please set the CROWDSTRIKE_CLIENT_ID and CROWDSTRIKE_CLIENT_SECRET environment variables."
+      "CrowdStrike credentials not configured. Please set the CROWDSTRIKE_CLIENT_ID and CROWDSTRIKE_CLIENT_SECRET environment variables.",
     );
   }
 
@@ -1192,7 +1297,7 @@ async function main() {
       capabilities: {
         tools: {},
       },
-    }
+    },
   );
 
   // List available tools
@@ -1216,7 +1321,7 @@ async function main() {
             args?.filter as string | undefined,
             (args?.limit as number) || 100,
             args?.offset as number | undefined,
-            args?.sort as string | undefined
+            args?.sort as string | undefined,
           );
           break;
 
@@ -1244,19 +1349,30 @@ async function main() {
           result = await apiClient.unhideHost(args?.host_ids as string[]);
           break;
 
+        case "crowdstrike_get_host_statistics":
+          result = await apiClient.getHostStatistics();
+          break;
+
+        case "crowdstrike_search_all_hosts":
+          result = await apiClient.searchAllHosts(
+            args?.filter as string | undefined,
+            args?.sort as string | undefined,
+          );
+          break;
+
         // Detection operations
         case "crowdstrike_search_detections":
           result = await apiClient.searchDetections(
             args?.filter as string | undefined,
             (args?.limit as number) || 100,
             args?.offset as number | undefined,
-            args?.sort as string | undefined
+            args?.sort as string | undefined,
           );
           break;
 
         case "crowdstrike_get_detection_details":
           result = await apiClient.getDetectionDetails(
-            args?.detection_ids as string[]
+            args?.detection_ids as string[],
           );
           break;
 
@@ -1265,7 +1381,7 @@ async function main() {
             args?.detection_ids as string[],
             args?.status as string,
             args?.assigned_to_uuid as string | undefined,
-            args?.comment as string | undefined
+            args?.comment as string | undefined,
           );
           break;
 
@@ -1275,13 +1391,13 @@ async function main() {
             args?.filter as string | undefined,
             (args?.limit as number) || 100,
             args?.offset as number | undefined,
-            args?.sort as string | undefined
+            args?.sort as string | undefined,
           );
           break;
 
         case "crowdstrike_get_incident_details":
           result = await apiClient.getIncidentDetails(
-            args?.incident_ids as string[]
+            args?.incident_ids as string[],
           );
           break;
 
@@ -1290,7 +1406,7 @@ async function main() {
             args?.incident_ids as string[],
             args?.status as number | undefined,
             args?.assigned_to_uuid as string | undefined,
-            args?.tags as string[] | undefined
+            args?.tags as string[] | undefined,
           );
           break;
 
@@ -1308,7 +1424,7 @@ async function main() {
             args?.filter as string | undefined,
             (args?.limit as number) || 100,
             args?.offset as number | undefined,
-            args?.sort as string | undefined
+            args?.sort as string | undefined,
           );
           break;
 
@@ -1325,7 +1441,7 @@ async function main() {
             args?.description as string | undefined,
             args?.severity as string | undefined,
             args?.expiration as string | undefined,
-            args?.tags as string[] | undefined
+            args?.tags as string[] | undefined,
           );
           break;
 
@@ -1338,7 +1454,7 @@ async function main() {
           result = await apiClient.searchVulnerabilities(
             args?.filter as string | undefined,
             (args?.limit as number) || 100,
-            args?.facet as string[] | undefined
+            args?.facet as string[] | undefined,
           );
           break;
 
@@ -1347,7 +1463,7 @@ async function main() {
           result = await apiClient.searchHostGroups(
             args?.filter as string | undefined,
             (args?.limit as number) || 100,
-            args?.offset as number | undefined
+            args?.offset as number | undefined,
           );
           break;
 
@@ -1355,7 +1471,7 @@ async function main() {
         case "crowdstrike_get_sensor_installers":
           result = await apiClient.getSensorInstallerDetails(
             args?.filter as string | undefined,
-            (args?.limit as number) || 100
+            (args?.limit as number) || 100,
           );
           break;
 
@@ -1365,7 +1481,7 @@ async function main() {
             args?.filter as string | undefined,
             (args?.limit as number) || 100,
             args?.offset as number | undefined,
-            args?.sort as string | undefined
+            args?.sort as string | undefined,
           );
           break;
 
@@ -1377,7 +1493,7 @@ async function main() {
           result = await apiClient.updateAlerts(
             args?.alert_ids as string[],
             args?.action as string,
-            args?.value as string | undefined
+            args?.value as string | undefined,
           );
           break;
 

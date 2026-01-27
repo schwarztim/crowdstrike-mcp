@@ -1,6 +1,6 @@
 {
   "name": "crowdstrike-mcp",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "description": "MCP server for CrowdStrike Falcon EDR/XDR platform",
   "main": "dist/index.js",
   "type": "module",
@@ -21,7 +21,8 @@
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
-    "axios": "^1.6.0"
+    "axios": "^1.6.0",
+    "dotenv": "^17.2.3"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",

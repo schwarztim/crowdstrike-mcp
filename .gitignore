@@ -4,8 +4,9 @@ node_modules/
 # Build output
 dist/
 
-# Environment files
+# Environment/credentials files
 .env
+/.env
 .env.local
 .env.*.local
 
@@ -26,3 +27,4 @@ npm-debug.log*
 
 # Coverage
 coverage/
+.thesun/
